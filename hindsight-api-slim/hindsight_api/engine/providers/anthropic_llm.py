@@ -22,6 +22,7 @@ from hindsight_api.engine.llm_interface import (
     LLMInterface,
     LLMToolChoice,
     LLMToolChoiceMode,
+    ProviderContentPolicyError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_llm_error
@@ -61,6 +62,20 @@ _EPHEMERAL_CACHE = {"type": "ephemeral"}
 # 400 from the API (not a silent truncation) and the operator can set the
 # scope's max_completion_tokens config.
 _DEFAULT_MAX_TOKENS = 64000
+
+_CONTENT_POLICY_STOP_REASONS = frozenset({"refusal", "content_filter"})
+
+
+def _raise_for_content_policy_refusal(response: Any) -> None:
+    """Fail fast when Anthropic returns a successful HTTP refusal response.
+
+    The Messages API can signal a refusal through ``stop_reason`` while leaving
+    no usable text/tool content. Treating that body as malformed JSON would put
+    a deterministic content-policy failure through the transient retry ladder.
+    """
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason in _CONTENT_POLICY_STOP_REASONS:
+        raise ProviderContentPolicyError(f"Anthropic refused the request (stop_reason={stop_reason}); not retrying")
 
 
 def _cached_system_blocks(system_prompt: str) -> list[dict[str, Any]]:
@@ -368,6 +383,7 @@ class AnthropicLLM(LLMInterface):
                 # Stash usage before parse/validate, which may raise locally
                 # even though the provider charged for these tokens (#2387).
                 stash_response_usage(_usage_from_anthropic_response(response))
+                _raise_for_content_policy_refusal(response)
 
                 if use_forced_tool:
                     # Forced tool_use → the validated args are already a dict; no parsing,
@@ -653,6 +669,7 @@ class AnthropicLLM(LLMInterface):
                         self._client.messages.create(**call_params), timeout=self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT
                     )
                 stash_response_usage(_usage_from_anthropic_response(response))
+                _raise_for_content_policy_refusal(response)
 
                 # Extract content and tool calls
                 content_parts = []
@@ -830,6 +847,8 @@ class AnthropicLLM(LLMInterface):
         Forced-tool responses carry their JSON in the tool_use block's input,
         so that is re-serialized as the content string.
         """
+        _raise_for_content_policy_refusal(message)
+
         content = ""
         tool_input = None
         for block in message.content:
